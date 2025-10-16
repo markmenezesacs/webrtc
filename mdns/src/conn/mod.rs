@@ -186,6 +186,11 @@ impl DnsConn {
         self.send_question(&name_with_suffix).await;
 
         loop {
+            if self.is_server_closed.load(atomic::Ordering::SeqCst) {
+                log::info!("Query exiting: server is closed");
+                return Err(Error::ErrConnectionClosed);
+            }
+
             tokio::select! {
                 _ = tokio::time::sleep(self.query_interval) => {
                     log::trace!("Sending query");

@@ -109,6 +109,7 @@ pub struct Agent {
     pub(crate) mdns_mode: MulticastDnsMode,
     pub(crate) mdns_name: String,
     pub(crate) mdns_conn: Option<Arc<DnsConn>>,
+    pub(crate) mdns_query_close_txs: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
     pub(crate) net: Arc<Net>,
 
     // 1:1 D-NAT IP address mapping
@@ -206,6 +207,7 @@ impl Agent {
             mdns_mode,
             mdns_name,
             mdns_conn,
+            mdns_query_close_txs: Arc::new(Mutex::new(Vec::new())),
             net,
             ext_ip_mapper: Arc::new(ext_ip_mapper),
             gathering_state: Arc::new(AtomicU8::new(0)), //GatheringState::New,
@@ -290,10 +292,15 @@ impl Agent {
             let ai = Arc::clone(&self.internal);
             let host_candidate = Arc::clone(c);
             let mdns_conn = self.mdns_conn.clone();
+            let mdns_query_close_txs = Arc::clone(&self.mdns_query_close_txs);
             tokio::spawn(async move {
                 if let Some(mdns_conn) = mdns_conn {
-                    if let Ok(candidate) =
-                        Self::resolve_and_add_multicast_candidate(mdns_conn, host_candidate).await
+                    if let Ok(candidate) = Self::resolve_and_add_multicast_candidate(
+                        mdns_conn,
+                        host_candidate,
+                        mdns_query_close_txs,
+                    )
+                    .await
                     {
                         ai.add_remote_candidate(&candidate).await;
                     }
@@ -347,6 +354,13 @@ impl Agent {
         if let UDPNetwork::Muxed(ref udp_mux) = self.udp_network {
             let (ufrag, _) = self.get_local_user_credentials().await;
             udp_mux.remove_conn_by_ufrag(&ufrag).await;
+        }
+
+        {
+            let mut txs = self.mdns_query_close_txs.lock().await;
+            for tx in txs.drain(..) {
+                let _ = tx.send(()).await;
+            }
         }
 
         Self::close_multicast_conn(&self.mdns_conn).await;
@@ -496,9 +510,15 @@ impl Agent {
     async fn resolve_and_add_multicast_candidate(
         mdns_conn: Arc<DnsConn>,
         c: Arc<dyn Candidate + Send + Sync>,
+        mdns_query_close_txs: Arc<Mutex<Vec<mpsc::Sender<()>>>>,
     ) -> Result<Arc<dyn Candidate + Send + Sync>> {
-        //TODO: hook up _close_query_signal_tx to Agent or Candidate's Close signal?
-        let (_close_query_signal_tx, close_query_signal_rx) = mpsc::channel(1);
+        let (close_query_signal_tx, close_query_signal_rx) = mpsc::channel(1);
+
+        {
+            let mut txs = mdns_query_close_txs.lock().await;
+            txs.push(close_query_signal_tx);
+        }
+
         let src = match mdns_conn.query(&c.address(), close_query_signal_rx).await {
             Ok((_, src)) => src,
             Err(err) => {
