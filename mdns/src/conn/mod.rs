@@ -1,11 +1,10 @@
-use core::sync::atomic;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::SockAddr;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use util::ifaces;
 
 use crate::config::*;
@@ -35,8 +34,7 @@ pub struct DnsConn {
     query_interval: Duration,
     queries: Arc<Mutex<Vec<Query>>>,
 
-    is_server_closed: Arc<atomic::AtomicBool>,
-    close_server: mpsc::Sender<()>,
+    close_server: broadcast::Sender<()>,
 }
 
 struct Query {
@@ -104,9 +102,7 @@ impl DnsConn {
 
         let dst_addr: SocketAddr = DEFAULT_DEST_ADDR.parse()?;
 
-        let is_server_closed = Arc::new(atomic::AtomicBool::new(false));
-
-        let (close_server_send, close_server_rcv) = mpsc::channel(1);
+        let (close_server_send, close_server_rcv) = broadcast::channel(1);
 
         let c = DnsConn {
             query_interval: if config.query_interval != Duration::from_secs(0) {
@@ -118,7 +114,6 @@ impl DnsConn {
             queries: Arc::new(Mutex::new(vec![])),
             socket: Arc::new(socket),
             dst_addr,
-            is_server_closed: Arc::clone(&is_server_closed),
             close_server: close_server_send,
         };
 
@@ -128,7 +123,6 @@ impl DnsConn {
         tokio::spawn(async move {
             DnsConn::start(
                 close_server_rcv,
-                is_server_closed,
                 socket,
                 local_names,
                 dst_addr,
@@ -143,12 +137,9 @@ impl DnsConn {
     /// Close closes the mDNS Conn
     pub async fn close(&self) -> Result<()> {
         log::info!("Closing connection");
-        if self.is_server_closed.load(atomic::Ordering::SeqCst) {
-            return Err(Error::ErrConnectionClosed);
-        }
 
         log::trace!("Sending close command to server");
-        match self.close_server.send(()).await {
+        match self.close_server.send(()) {
             Ok(_) => {
                 log::trace!("Close command sent");
                 Ok(())
@@ -165,11 +156,12 @@ impl DnsConn {
     pub async fn query(
         &self,
         name: &str,
-        mut close_query_signal: mpsc::Receiver<()>,
     ) -> Result<(ResourceHeader, SocketAddr)> {
-        if self.is_server_closed.load(atomic::Ordering::SeqCst) {
+        if self.close_server.receiver_count() == 0 {
             return Err(Error::ErrConnectionClosed);
         }
+
+        let mut close_query_signal = self.close_server.subscribe();
 
         let name_with_suffix = name.to_owned() + ".";
 
@@ -243,8 +235,7 @@ impl DnsConn {
     }
 
     async fn start(
-        mut closed_rx: mpsc::Receiver<()>,
-        close_server: Arc<atomic::AtomicBool>,
+        mut closed_rx: broadcast::Receiver<()>,
         socket: Arc<UdpSocket>,
         local_names: Vec<String>,
         dst_addr: SocketAddr,
@@ -259,8 +250,6 @@ impl DnsConn {
             tokio::select! {
                 _ = closed_rx.recv() => {
                     log::info!("Closing server connection");
-                    close_server.store(true, atomic::Ordering::SeqCst);
-
                     return Ok(());
                 }
 

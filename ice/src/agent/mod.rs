@@ -497,9 +497,7 @@ impl Agent {
         mdns_conn: Arc<DnsConn>,
         c: Arc<dyn Candidate + Send + Sync>,
     ) -> Result<Arc<dyn Candidate + Send + Sync>> {
-        //TODO: hook up _close_query_signal_tx to Agent or Candidate's Close signal?
-        let (_close_query_signal_tx, close_query_signal_rx) = mpsc::channel(1);
-        let src = match mdns_conn.query(&c.address(), close_query_signal_rx).await {
+        let src = match mdns_conn.query(&c.address()).await {
             Ok((_, src)) => src,
             Err(err) => {
                 log::warn!("Failed to discover mDNS candidate {}: {}", c.address(), err);
